@@ -1,85 +1,121 @@
+// =============================================================================
+// ENGINE SOUND SIMULATOR
+// Arduino Uno R3
+// =============================================================================
+// Description:
+//   Simulates car engine sounds procedurally using a passive piezo buzzer.
+//   A potentiometer controls throttle, three buttons handle gear shifting and
+//   engine profile cycling, and a 16x2 I2C LCD shows live RPM, gear, throttle
+//   percentage, and engine type.
+//
+// Author:       Crimz
+// Version:      1.0.0
+// Date:         2026
+// Platform:     Arduino Uno R3
+// Dependencies: Wire.h, LiquidCrystal_I2C
+// =============================================================================
+
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 
 // ---------- LCD ----------
-LiquidCrystal_I2C lcd(0x27, 16, 2);  // change to 0x3F if blank
+// Default I2C address is 0x27. If LCD shows nothing, try 0x3F instead.
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-// ---------- Pins ----------
-const int POT_PIN = A0;
-const int BTN_UP = 2;
-const int BTN_DOWN = 3;
-const int BTN_PROFILE = 4;
-const int BUZZER_PIN = 9;
+// ---------- Pin Definitions ----------
+const int POT_PIN     = A0;   // Potentiometer wiper (throttle input)
+const int BTN_UP      = 2;    // Shift up button
+const int BTN_DOWN    = 3;    // Shift down button
+const int BTN_PROFILE = 4;    // Engine profile cycle button
+const int BUZZER_PIN  = 9;    // Passive piezo buzzer
 
-// ---------- Engine Profile Struct ----------
+// =============================================================================
+// ENGINE PROFILE STRUCT
+// Each profile defines the character of one engine type.
+// =============================================================================
 struct EngineProfile {
-  const char* name;
-  int idleRPM;
-  int maxRPM;
-  int baseTone;      // base pitch at idle (Hz)
-  int toneRange;     // how much pitch increases to max RPM
-  float responseSpeed; // how fast RPM follows throttle (higher = faster)
-  int roughness;     // random Hz wobble amount
+  const char* name;     // Displayed on LCD (max 7 chars recommended)
+  int idleRPM;          // RPM at zero throttle
+  int maxRPM;           // RPM ceiling (rev limiter engages near here)
+  int baseTone;         // Buzzer frequency (Hz) at idle
+  int toneRange;        // How much frequency increases from idle to max RPM
+  float responseSpeed;  // How quickly RPM follows throttle (0.01=slow, 0.15=fast)
+  int roughness;        // Random Hz wobble added to simulate engine texture
 };
 
+// ---------- Profile Definitions ----------
+// Adjust baseTone and toneRange to taste — these are starting points.
 EngineProfile profiles[] = {
-  {"Inline-4",  800, 6500, 80,  600, 0.06, 15},
-  {"V6",        750, 6800, 70,  650, 0.05, 20},
-  {"V8",        700, 6000, 50,  500, 0.04, 30},
-  {"SportsHi",  1200, 9000, 120, 900, 0.10, 10}
+  //  Name        idleRPM  maxRPM  baseTone  toneRange  responseSpeed  roughness
+  {  "Inline-4",   800,    6500,     80,       600,        0.06,          15  },
+  {  "V6",         750,    6800,     70,       650,        0.05,          20  },
+  {  "V8",         700,    6000,     50,       500,        0.04,          30  },
+  {  "SportsHi",  1200,    9000,    120,       900,        0.10,          10  }
 };
 const int NUM_PROFILES = 4;
 int currentProfile = 0;
 
-// ---------- Gear System ----------
-// Index 0 = Neutral, 1-6 = gears
-const char* gearNames[] = {"N", "1", "2", "3", "4", "5", "6"};
-int currentGear = 0; // start in neutral
+// =============================================================================
+// GEAR SYSTEM
+// 0 = Neutral, 1-6 = drive gears
+// Gear ratios determine how much throttle translates into RPM in each gear.
+// Higher gear = lower ratio = RPM rises more slowly.
+// =============================================================================
+const char* gearNames[] = { "N", "1", "2", "3", "4", "5", "6" };
+int currentGear = 0;   // Start in Neutral
 const int MAX_GEAR = 6;
 
-// Gear ratio affects how throttle->RPM scales (higher gear = RPM rises slower)
-float gearRatio[] = {1.0, 1.0, 0.85, 0.70, 0.58, 0.48, 0.40};
+// gearRatio[0] is neutral — revving freely.
+// Lower values mean throttle has less RPM effect (higher gears feel "loaded").
+float gearRatio[] = { 1.0, 1.0, 0.85, 0.70, 0.58, 0.48, 0.40 };
 
-// ---------- RPM / Throttle ----------
-int throttlePercent = 0;
-float currentRPM = 0;
-float targetRPM = 0;
+// ---------- RPM / Throttle State ----------
+int   throttlePercent = 0;    // 0-100 from potentiometer
+float currentRPM      = 0;    // Actual RPM (smoothed)
+float targetRPM       = 0;    // RPM we're moving toward
 
 // ---------- Gear Shift Effect ----------
-bool shiftingEffect = false;
-unsigned long shiftEffectStart = 0;
-const unsigned long SHIFT_EFFECT_DURATION = 180; // ms RPM drop / sound cut
+bool          shiftingEffect    = false;
+unsigned long shiftEffectStart  = 0;
+const unsigned long SHIFT_EFFECT_DURATION = 180;  // ms of RPM dip during shift
 
-// ---------- Button Debounce ----------
-unsigned long lastDebounceUp = 0;
-unsigned long lastDebounceDown = 0;
+// ---------- Button Debounce Timestamps ----------
+unsigned long lastDebounceUp      = 0;
+unsigned long lastDebounceDown    = 0;
 unsigned long lastDebounceProfile = 0;
-const unsigned long DEBOUNCE_DELAY = 200;
+const unsigned long DEBOUNCE_DELAY = 200;  // ms between accepted presses
 
-// ---------- Sound Update Timing ----------
-unsigned long lastSoundUpdate = 0;
-const unsigned long SOUND_UPDATE_INTERVAL = 20; // ms
-
-// ---------- Display Timing ----------
+// ---------- Update Intervals (millis-based, non-blocking) ----------
+unsigned long lastSoundUpdate   = 0;
 unsigned long lastDisplayUpdate = 0;
-const unsigned long DISPLAY_UPDATE_INTERVAL = 150; // ms
+const unsigned long SOUND_UPDATE_INTERVAL   = 20;   // ms — sound refresh rate
+const unsigned long DISPLAY_UPDATE_INTERVAL = 150;  // ms — LCD refresh rate
 
+// =============================================================================
+// SETUP
+// =============================================================================
 void setup() {
-  pinMode(BTN_UP, INPUT_PULLUP);
-  pinMode(BTN_DOWN, INPUT_PULLUP);
+  pinMode(BTN_UP,      INPUT_PULLUP);  // Buttons wire to GND; LOW = pressed
+  pinMode(BTN_DOWN,    INPUT_PULLUP);
   pinMode(BTN_PROFILE, INPUT_PULLUP);
-  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(BUZZER_PIN,  OUTPUT);
 
   lcd.init();
   lcd.backlight();
   lcd.setCursor(0, 0);
   lcd.print("Engine Simulator");
+  lcd.setCursor(0, 1);
+  lcd.print("  Starting...   ");
   delay(800);
   lcd.clear();
 
+  // Initialise RPM at idle for the default profile
   currentRPM = profiles[currentProfile].idleRPM;
 }
 
+// =============================================================================
+// MAIN LOOP — non-blocking, all timed with millis()
+// =============================================================================
 void loop() {
   readThrottle();
   updateButtons();
@@ -88,34 +124,43 @@ void loop() {
   updateDisplay();
 }
 
-// ---------- Read Throttle ----------
+// =============================================================================
+// READ THROTTLE
+// Reads the potentiometer and converts to a 0-100% value.
+// =============================================================================
 void readThrottle() {
-  int raw = analogRead(POT_PIN); // 0-1023
+  int raw = analogRead(POT_PIN);  // Returns 0–1023
   throttlePercent = map(raw, 0, 1023, 0, 100);
 }
 
-// ---------- Buttons ----------
+// =============================================================================
+// UPDATE BUTTONS
+// Polls all three buttons each loop with millis()-based debouncing.
+// INPUT_PULLUP means the pin is HIGH at rest and LOW when button is pressed.
+// =============================================================================
 void updateButtons() {
   unsigned long now = millis();
 
-  // Shift Up
+  // --- Shift Up ---
   if (digitalRead(BTN_UP) == LOW && (now - lastDebounceUp) > DEBOUNCE_DELAY) {
     shiftUp();
     lastDebounceUp = now;
   }
 
-  // Shift Down
+  // --- Shift Down ---
   if (digitalRead(BTN_DOWN) == LOW && (now - lastDebounceDown) > DEBOUNCE_DELAY) {
     shiftDown();
     lastDebounceDown = now;
   }
 
-  // Profile Change
+  // --- Engine Profile ---
   if (digitalRead(BTN_PROFILE) == LOW && (now - lastDebounceProfile) > DEBOUNCE_DELAY) {
     cycleEngineProfile();
     lastDebounceProfile = now;
   }
 }
+
+// ---------- Gear Functions ----------
 
 void shiftUp() {
   if (currentGear < MAX_GEAR) {
@@ -131,55 +176,63 @@ void shiftDown() {
   }
 }
 
+// Marks the start of a gear-change event (RPM dip + sound cut)
 void triggerShiftEffect() {
-  shiftingEffect = true;
+  shiftingEffect   = true;
   shiftEffectStart = millis();
 }
 
+// Cycles through engine profiles, resetting RPM to the new idle
 void cycleEngineProfile() {
   currentProfile++;
   if (currentProfile >= NUM_PROFILES) currentProfile = 0;
-  // Reset RPM to new profile's idle so transitions feel clean
   currentRPM = profiles[currentProfile].idleRPM;
 }
 
-// ---------- RPM Calculation ----------
+// =============================================================================
+// UPDATE RPM
+// Calculates targetRPM from throttle + gear, then smoothly moves currentRPM
+// toward it using the profile's responseSpeed.
+// =============================================================================
 void updateRPM() {
   EngineProfile p = profiles[currentProfile];
 
   if (currentGear == 0) {
-    // Neutral: RPM follows throttle directly (revving in neutral)
+    // Neutral: free-revving, RPM responds directly to throttle
     targetRPM = p.idleRPM + (throttlePercent / 100.0) * (p.maxRPM - p.idleRPM);
   } else {
-    // In gear: higher gears reduce how much throttle raises RPM
+    // In gear: ratio reduces how far throttle can push RPM
     float ratio = gearRatio[currentGear];
     targetRPM = p.idleRPM + (throttlePercent / 100.0) * (p.maxRPM - p.idleRPM) * ratio;
   }
 
-  // Rev limiter: hard cap near max RPM, with a "bounce" feel
-  if (targetRPM > p.maxRPM) {
-    targetRPM = p.maxRPM;
-  }
+  // Hard rev limiter cap
+  if (targetRPM > p.maxRPM) targetRPM = p.maxRPM;
 
-  // Smoothly move currentRPM toward targetRPM (response speed)
+  // Smooth approach to target (exponential easing)
+  // Larger responseSpeed = RPM catches up faster (sports vs heavy engine feel)
   currentRPM += (targetRPM - currentRPM) * p.responseSpeed;
 
-  // Apply gear shift RPM dip
+  // Gear shift RPM dip: briefly multiply RPM down to simulate clutch/ignition cut
   if (shiftingEffect) {
     if (millis() - shiftEffectStart < SHIFT_EFFECT_DURATION) {
-      currentRPM *= 0.6; // sudden drop during shift
+      currentRPM *= 0.6;
     } else {
       shiftingEffect = false;
     }
   }
 
-  // Keep RPM from going below idle (unless engine "off" - not implemented)
+  // Floor: prevent RPM falling below 90% of idle (engine won't stall)
   if (currentRPM < p.idleRPM * 0.9) {
     currentRPM = p.idleRPM * 0.9;
   }
 }
 
-// ---------- Sound Generation ----------
+// =============================================================================
+// UPDATE ENGINE SOUND
+// Runs every SOUND_UPDATE_INTERVAL ms. Maps currentRPM to a buzzer frequency,
+// then adds roughness, idle wobble, and rev limiter flutter.
+// =============================================================================
 void updateEngineSound() {
   unsigned long now = millis();
   if (now - lastSoundUpdate < SOUND_UPDATE_INTERVAL) return;
@@ -187,41 +240,46 @@ void updateEngineSound() {
 
   EngineProfile p = profiles[currentProfile];
 
-  // During shift effect: brief silence
+  // Cut sound entirely during the gear shift dip
   if (shiftingEffect) {
     noTone(BUZZER_PIN);
     return;
   }
 
-  // Map current RPM to a base frequency using profile's tone settings
+  // Normalise currentRPM to a 0.0–1.0 fraction of the RPM range
   float rpmFraction = (currentRPM - p.idleRPM) / (float)(p.maxRPM - p.idleRPM);
-  if (rpmFraction < 0) rpmFraction = 0;
-  if (rpmFraction > 1) rpmFraction = 1;
+  rpmFraction = constrain(rpmFraction, 0.0, 1.0);
 
+  // Base frequency: linearly interpolated from baseTone to baseTone+toneRange
   int baseFreq = p.baseTone + (int)(rpmFraction * p.toneRange);
 
-  // Roughness: more wobble at low RPM, smoother at high RPM
-  // roughness scales down as rpmFraction increases
+  // Roughness: larger wobble at low RPM, reduces as RPM climbs
   int roughAmount = (int)(p.roughness * (1.0 - rpmFraction * 0.8));
   int wobble = random(-roughAmount, roughAmount + 1);
 
-  // Idle wobble: extra random jitter when near idle
+  // Extra jitter at idle to simulate lumpy combustion
   if (rpmFraction < 0.05) {
     wobble += random(-5, 6);
   }
 
-  // Rev limiter effect: rapid pitch flutter near max RPM
+  // Rev limiter flutter: rapid pitch bounce near redline
   if (rpmFraction > 0.97) {
     wobble += (random(0, 2) == 0) ? 100 : -100;
   }
 
   int finalFreq = baseFreq + wobble;
-  if (finalFreq < 20) finalFreq = 20; // avoid invalid tone()
+  if (finalFreq < 20) finalFreq = 20;  // tone() minimum valid frequency
 
   tone(BUZZER_PIN, finalFreq);
 }
 
-// ---------- Display ----------
+// =============================================================================
+// UPDATE DISPLAY
+// Refreshes the 16x2 LCD every DISPLAY_UPDATE_INTERVAL ms.
+// Layout:
+//   Row 0:  RPM:XXXX    G:X
+//   Row 1:  Thr:XX%   ProfName
+// =============================================================================
 void updateDisplay() {
   unsigned long now = millis();
   if (now - lastDisplayUpdate < DISPLAY_UPDATE_INTERVAL) return;
@@ -229,15 +287,18 @@ void updateDisplay() {
 
   EngineProfile p = profiles[currentProfile];
 
+  // --- Row 0: RPM and Gear ---
   lcd.setCursor(0, 0);
   lcd.print("RPM:");
   lcd.print((int)currentRPM);
-  lcd.print("    "); // clear trailing chars
+  lcd.print("    ");   // clear trailing chars from previous longer value
 
   lcd.setCursor(11, 0);
   lcd.print("G:");
   lcd.print(gearNames[currentGear]);
+  lcd.print(" ");
 
+  // --- Row 1: Throttle and Engine Profile ---
   lcd.setCursor(0, 1);
   lcd.print("Thr:");
   lcd.print(throttlePercent);
@@ -245,5 +306,5 @@ void updateDisplay() {
 
   lcd.setCursor(9, 1);
   lcd.print(p.name);
-  lcd.print("    "); // pad to clear leftovers from longer names
+  lcd.print("    ");   // pad to erase leftovers from longer profile names
 }
